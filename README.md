@@ -76,15 +76,10 @@ which one to open.
 
 Every workflow in one ranked list, in a fixed order you walk again and again:
 **Baseline** you clear once and then watch, **Ongoing** never has a last item,
-**On demand** waits for a tracker to ask. Each row states what it would cost you
-to ignore it. Underneath sits a shelf of **useless prizes** — over 650 named
-tiers and 109 one-off feats, in the spirit of Progress Quest, awarded for work
-you were going to do anyway and never taken back. They keep going once your
-library is tidy, which is when a prize layer usually gives up on you: the
-largest library you've ever held with nothing wrong with it, everything you
-seed multiplied by how long you've held it, your longest-lived single torrent.
-Under it all is the record of how you got here — every rung and feat, dated, in
-the order you earned them.
+**On demand** waits for a tracker to ask. Under it sits a shelf of **useless
+prizes** — 650+ named tiers and 109 feats in the spirit of Progress Quest,
+awarded for work you were going to do anyway and never taken back — and a dated
+record of every one you've earned.
 
 <p>
   <a href="docs/rounds.png"><img src="docs/rounds.png" alt="Rounds" width="100%" /></a>
