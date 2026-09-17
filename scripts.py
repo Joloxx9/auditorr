@@ -493,7 +493,9 @@ comparison_progress() {
 verify_identical() {
   local source=$1 target=$2 size=$3 started=$SECONDS last=$SECONDS status
   printf '  Comparing: %s — starting\n' "$(human_size "$size")"
-  cmp -s "$source" "$target" &
+  # Do not expose our retained descriptors to cmp: progress must track its
+  # actual input descriptor, not an inherited descriptor whose offset stays 0.
+  cmp -s "$source" "$target" 8<&- 9<&- &
   COMPARE_PID=$!
   while kill -0 "$COMPARE_PID" 2>/dev/null; do
     if [ "$((SECONDS-last))" -ge 2 ]; then
