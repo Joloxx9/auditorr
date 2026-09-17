@@ -248,7 +248,10 @@ Review the duplicate groups, select the ones you want collapsed, and generate a
 script that replaces each copy with a hardlink to a single kept file. The script
 runs in Bash on the host using standard system tools; Python is not required.
 It runs `cmp` once per separate inode before linking, then replaces all included
-hardlink paths using a temporary hardlink and an atomic rename. Excluded paths
+hardlink paths using a temporary hardlink and an atomic rename. During comparison
+it displays the group/copy number, file size, and elapsed time, refreshing every
+two seconds. On Linux, when available, it also shows bytes read and percentage;
+other hosts show a heartbeat. Only a successful comparison is marked verified. Excluded paths
 are left alone. Copies on different filesystems are never linked together.
 
 Stop processes writing these files before running the script. A failed operation

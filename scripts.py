@@ -353,12 +353,13 @@ def _build_dedupe_script(results, cfg, now_str, selection):
         f'# {len(groups)} duplicate groups; {_human_size(total_recoverable)} potentially recoverable',
         f'# {excluded_count} excluded duplicate records',
         f'# Run with bash from the host directory corresponding to {script_root!r}.',
-        '# Uses Bash and system tools (cmp, stat, ln, mv, mktemp, rm, rmdir).',
+        '# Uses Bash and system tools (cmp, stat, ln, mv, mktemp, rm, rmdir, sleep).',
         '# Stop writers before running; files must remain unchanged during deduplication.',
         '# Reported bytes are logical size of copies with no remaining hardlinks,',
         '# not a measurement of free disk space (snapshots/open files may retain data).',
         _DEDUPE_RUNTIME,
     ]
+    lines.append(f'TOTAL_GROUPS={len(non_skipped_groups)}')
     for group in non_skipped_groups:
         # Prefix relative paths so option-like filenames are safe on BSD too.
         paths = [shlex.quote('./' + f['path']) for f in group['files']]
@@ -379,6 +380,8 @@ LINKED=0
 SKIPPED=0
 ERRORS=0
 TMP_DIR=''
+COMPARE_PID=''
+GROUP_NUMBER=0
 
 error() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -391,7 +394,14 @@ cleanup_temp() {
     TMP_DIR=''
   fi
 }
-trap 'cleanup_temp' EXIT
+cleanup() {
+  if [ -n "$COMPARE_PID" ]; then
+    kill "$COMPARE_PID" 2>/dev/null || :
+    wait "$COMPARE_PID" 2>/dev/null || :
+  fi
+  cleanup_temp
+}
+trap 'cleanup' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -430,7 +440,15 @@ file_stat() {
 regular_file() { [ -f "$1" ] && [ ! -L "$1" ]; }
 unchanged() {
   local actual
-  actual=$(file_stat signature "$1") && [ "$actual" = "$2" ]
+  if ! actual=$(file_stat signature "$1"); then
+    printf '  Metadata unavailable: %s\n' "$1" >&2
+    return 1
+  fi
+  if [ "$actual" != "$2" ]; then
+    printf '  Metadata mismatch: %s\n' "$1" >&2
+    printf '    Fields: device:inode:size:mtime\n    Expected: %s\n    Observed: %s\n' "$2" "$actual" >&2
+    return 1
+  fi
 }
 replace_target() {
   if [ "$STAT_STYLE" = gnu ]; then
@@ -441,10 +459,65 @@ replace_target() {
   fi
 }
 
+human_size() {
+  local value=$1 unit=0 fraction=0
+  local units=(B KiB MiB GiB TiB PiB)
+  while [ "$value" -ge 1024 ] && [ "$unit" -lt 5 ]; do
+    fraction=$((value % 1024 * 10 / 1024))
+    value=$((value / 1024))
+    unit=$((unit+1))
+  done
+  printf '%s.%s %s' "$value" "$fraction" "${units[unit]}"
+}
+
+comparison_progress() {
+  local source=$1 size=$2 elapsed=$3 info field value rest position=''
+  # Linux exposes cmp's input offset without reading the data a second time.
+  # This measures bytes read (cmp may buffer ahead), not completed verification.
+  for info in /proc/"$COMPARE_PID"/fdinfo/*; do
+    [ -r "$info" ] && [ "/proc/$COMPARE_PID/fd/${info##*/}" -ef "$source" ] || continue
+    while read -r field value rest; do
+      if [ "$field" = 'pos:' ]; then position=$value; break; fi
+    done < "$info" 2>/dev/null
+    [ -z "$position" ] || break
+  done
+  if [[ "$position" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+    [ "$position" -le "$size" ] || position=$size
+    printf '  Comparing: %s / %s (%s%% read), elapsed %ss\n' \
+      "$(human_size "$position")" "$(human_size "$size")" "$((position * 100 / size))" "$elapsed"
+  else
+    printf '  Comparing: %s — still working, elapsed %ss\n' "$(human_size "$size")" "$elapsed"
+  fi
+}
+
+verify_identical() {
+  local source=$1 target=$2 size=$3 started=$SECONDS last=$SECONDS status
+  printf '  Comparing: %s — starting\n' "$(human_size "$size")"
+  cmp -s "$source" "$target" &
+  COMPARE_PID=$!
+  while kill -0 "$COMPARE_PID" 2>/dev/null; do
+    if [ "$((SECONDS-last))" -ge 2 ]; then
+      comparison_progress "$source" "$size" "$((SECONDS-started))"
+      last=$SECONDS
+    fi
+    sleep 0.1
+  done
+  wait "$COMPARE_PID"
+  status=$?
+  COMPARE_PID=''
+  if [ "$status" -eq 0 ]; then
+    printf '  Verified: %s (100%%), elapsed %ss\n' "$(human_size "$size")" "$((SECONDS-started))"
+  fi
+  return "$status"
+}
+
 dedupe_group() {
   local canonical=$1 source_key source_sig old_key old_sig size links status
-  local path key candidate i j seen
+  local path key candidate i j seen copy_number=0 copy_total=0
+  local unique_keys=()
   local paths=("$@") keys=() processed=()
+  GROUP_NUMBER=$((GROUP_NUMBER+1))
+  printf '\nGroup %s/%s — kept file: %s\n' "$GROUP_NUMBER" "$TOTAL_GROUPS" "$canonical"
   if ! regular_file "$canonical"; then
     error "Missing or non-regular canonical: $canonical"
     return
@@ -466,6 +539,15 @@ dedupe_group() {
       keys+=('')
     fi
   done
+  for key in "${keys[@]}"; do
+    [ -n "$key" ] && [ "$key" != "$source_key" ] || continue
+    seen=0
+    for old_key in "${unique_keys[@]}"; do
+      [ "$key" != "$old_key" ] || seen=1
+    done
+    if [ "$seen" -eq 0 ]; then unique_keys+=("$key"); fi
+  done
+  copy_total=${#unique_keys[@]}
   for ((i=0; i<${#paths[@]}; i++)); do
     old_key=${keys[i]}
     [ -n "$old_key" ] && [ "$old_key" != "$source_key" ] || continue
@@ -475,6 +557,7 @@ dedupe_group() {
     done
     [ "$seen" -eq 0 ] || continue
     processed+=("$old_key")
+    copy_number=$((copy_number+1))
     if [ "${old_key%%:*}" != "${source_key%%:*}" ]; then
       printf 'SKIP: different filesystem: %s\n' "${paths[i]}"
       SKIPPED=$((SKIPPED+1))
@@ -494,7 +577,9 @@ dedupe_group() {
     fi
     size=$(file_stat size /dev/fd/9) || { error "Cannot stat $candidate"; exec 9<&-; continue; }
     printf 'Verifying: %s\n' "$candidate"
-    cmp -s "$canonical" "$candidate"
+    printf '  Group %s/%s, copy %s/%s — %s (%s bytes)\n' \
+      "$GROUP_NUMBER" "$TOTAL_GROUPS" "$copy_number" "$copy_total" "$(human_size "$size")" "$size"
+    verify_identical "$canonical" "$candidate" "$size"
     status=$?
     if [ "$status" -ne 0 ]; then
       if [ "$status" -eq 1 ]; then
@@ -527,6 +612,7 @@ dedupe_group() {
         error "File changed before replacement: $path"
       elif replace_target "$TMP_DIR/replacement" "$path"; then
         LINKED=$((LINKED+1))
+        printf '  Linked: %s\n' "$path"
       else
         error "Cannot replace target: $path"
       fi
@@ -540,6 +626,7 @@ dedupe_group() {
     if links=$(file_stat links /dev/fd/9); then
       if [ "$links" -eq 0 ]; then
         RECLAIMED=$((RECLAIMED+size))
+        printf '  Reclaimed: %s; total: %s\n' "$(human_size "$size")" "$(human_size "$RECLAIMED")"
       else
         printf 'No space counted: old copy still has hardlinks.\n'
       fi
@@ -549,5 +636,6 @@ dedupe_group() {
     exec 9<&-
   done
   exec 8<&-
+  printf 'Group %s/%s complete — paths linked: %s, errors: %s\n' "$GROUP_NUMBER" "$TOTAL_GROUPS" "$LINKED" "$ERRORS"
 }
 '''

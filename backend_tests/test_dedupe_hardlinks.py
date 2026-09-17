@@ -31,7 +31,7 @@ def run_script(root, script, overrides=None):
     # Exercise the real generated Bash script with a PATH that has NO Python.
     # Failure injection wraps OS commands, without changing the script itself.
     with tempfile.TemporaryDirectory() as tool_dir:
-        for command in ('cmp', 'stat', 'ln', 'mv', 'mktemp', 'rm', 'rmdir'):
+        for command in ('cmp', 'stat', 'ln', 'mv', 'mktemp', 'rm', 'rmdir', 'sleep'):
             dest = Path(tool_dir) / command
             if command in (overrides or {}):
                 dest.write_text('#!/bin/bash\n' + overrides[command])
@@ -326,3 +326,52 @@ def test_more_copies_than_map_cap_are_merged(tmp_path):
     assert 'Paths linked: 12' in result.stdout
     assert 'Reclaimed bytes (logical): 60' in result.stdout
     assert len({p.stat().st_ino for p in copies}) == 1
+
+
+def test_progress_reports_size_and_completion(tmp_path):
+    files(tmp_path)
+    result = run_script(tmp_path, generate(tmp_path))
+    assert result.returncode == 0, result.stderr
+    assert 'Group 1/1, copy 1/1' in result.stdout
+    assert '10.0 B (10 bytes)' in result.stdout
+    assert 'Verified: 10.0 B (100%)' in result.stdout
+    assert 'Group 1/1 complete' in result.stdout
+
+
+def test_slow_comparison_shows_heartbeat_and_preserves_error(tmp_path):
+    a, siblings = files(tmp_path)
+    before = {p: p.stat().st_ino for p in [a] + siblings}
+    result = run_script(tmp_path, generate(tmp_path), {'cmp': 'sleep 3; exit 2\n'})
+    assert result.returncode == 1
+    assert 'still working, elapsed' in result.stdout
+    assert 'Comparison failed' in result.stderr
+    assert 'Verified:' not in result.stdout
+    assert before == {p: p.stat().st_ino for p in before}
+
+
+def test_changed_metadata_diagnostic_preserves_targets(tmp_path):
+    a, siblings = files(tmp_path)
+    results, _ = snapshot(tmp_path)
+    results['torrent_files'].sort(key=lambda f: f['path'] != 'A')
+    script = scripts.generate_script('dedupe', results, {'LOCAL_PATH': str(tmp_path)})
+    before = {p: p.stat().st_ino for p in [a] + siblings}
+    cmp_then_write = (f'{shlex.quote(shutil.which("cmp"))} "$@" || exit $?\n'
+                      'printf changed >> ./A\nexit 0\n')
+    result = run_script(tmp_path, script, {'cmp': cmp_then_write})
+    assert result.returncode == 1
+    assert 'Metadata mismatch: ./A' in result.stderr
+    assert 'Fields: device:inode:size:mtime' in result.stderr
+    assert 'Expected:' in result.stderr and 'Observed:' in result.stderr
+    assert 'Reclaimed bytes (logical): 0' in result.stdout
+    assert before == {p: p.stat().st_ino for p in before}
+
+
+@pytest.mark.skipif(not Path('/proc/self/fdinfo').exists(), reason='Linux fdinfo progress')
+def test_linux_progress_reports_read_bytes(tmp_path):
+    files(tmp_path)
+    slow_cmp = ('exec 3< "$2"\nread -r -N 5 <&3\nsleep 3\n'
+                f'exec {shlex.quote(shutil.which("cmp"))} "$@"\n')
+    result = run_script(tmp_path, generate(tmp_path), {'cmp': slow_cmp})
+    assert result.returncode == 0, result.stderr
+    assert '5.0 B / 10.0 B (50% read)' in result.stdout
+    assert 'Verified: 10.0 B (100%)' in result.stdout

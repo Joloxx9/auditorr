@@ -17,6 +17,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Test backend and generated Bash scripts
+        env:
+          DATA_DIR: ${{ runner.temp }}/auditorr-test-data
+        run: |
+          python3 -m venv "$RUNNER_TEMP/auditorr-test-venv"
+          "$RUNNER_TEMP/auditorr-test-venv/bin/pip" install -r requirements.txt pytest
+          "$RUNNER_TEMP/auditorr-test-venv/bin/python" -m pytest -q backend_tests
+
       # arm64 emulation for the runtime stage (pure-Python deps, so no
       # compilation happens under QEMU — see the frontend note in Dockerfile).
       - name: Set up QEMU
